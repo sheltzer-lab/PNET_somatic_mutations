@@ -1,0 +1,1879 @@
+---
+title: "Somatic mutational profiling identifies aggressive and indolent disease phenotypes in well-differentiated pancreatic neuroendocrine tumors"
+author: "Ryan A. Hagenson"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+    toc: yes
+    toc_float: yes
+    toc_depth: 3
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+
+Sys.setenv("VROOM_CONNECTION_SIZE" = 131072 * 4)
+```
+
+## Load Libraries
+```{r}
+library(assertr)
+library(forestmodel)
+library(ggrepel)
+library(ggsurvfit)
+library(gt)
+library(gtsummary)
+library(maftools)
+library(reshape2)
+library(survival)
+library(tidyverse)
+```
+
+## Constants
+```{r}
+# We are interested in those mutations that occur at or above a percentage of total in a subset
+penetrance <- 0.05
+
+# Color scheme to emphasize mutual exclusivity results
+mutex.colors <- circlize::colorRamp2(c(-1.96, 0, 1.96), c("#66C2A5", "white", "#F46D43"))
+
+# Names of non-synonymous variants
+vc_nonSyn = c(
+  "Frame Shift",
+  "Splice Site",
+  "Translation Start Site",
+  "Nonsense Mutation",
+  "Nonstop Mutation",
+  "In Frame",
+  "Missense Mutation"
+)
+```
+
+## Functions
+```{r}
+p.to.Z <- function(p) {
+  p <- round(p, digits = .Machine$double.exponent - 1)
+  #' Converts a two-tailed p-value to standardized Z score
+  if (!is.numeric(p)) {
+    p <- as.numeric(p)
+  }
+  if (!is.numeric(p)) {
+    stop("p was not coercible to numeric type")
+  }
+  ll <- length(which(p < 0 | p > 1))
+  if (ll > 0) {
+    warning(ll, " invalid p-values set to NA")
+    p[p < 0 | p > 1] <- NA
+  }
+  O <- qnorm((p / 2), F)
+  O[!is.finite(O)] <- NA
+  return(-O)
+}
+
+reduceModel <- function(model, cutoff = 4) {
+  selectedMod <- model
+  all_vifs <- as.data.frame(car::vif(selectedMod), keep.rownames = TRUE)
+  signif_all <- rownames(all_vifs)
+  
+  while (any(all_vifs$GVIF > cutoff)) {
+    var_with_max_vif <-
+      rownames(all_vifs)[[which(all_vifs$GVIF == max(all_vifs$GVIF))]]  # get the var with max vif
+    signif_all <-
+      signif_all[!(signif_all) %in% var_with_max_vif]  # remove
+    myForm <-
+      as.formula(paste("is_wgd ~ ", paste (signif_all, collapse = " + "), sep =
+                         ""))  # new formula
+    selectedMod <-
+      glm(myForm,
+          family = binomial(link = 'logit'),
+          data = model$data)
+    all_vifs <-
+      as.data.frame(car::vif(selectedMod), keep.rownames = TRUE)
+  }
+  selectedMod
+}
+```
+
+## Data Munging
+```{r, message=FALSE}
+regional.LN <- read_csv("data/ref/regional LN.csv", comment = '#')
+
+supplemental <-
+  read.csv('data/ref/Updated PNET case list.csv', stringsAsFactors = FALSE) %>%
+  mutate(across(c('Nodal.Involvement', 'Metastatic'), as.numeric)) %>%
+  mutate(Grade.1 = case_when(
+    !is.na(Grade.1) ~ Grade.1,
+    str_detect(Dataset, "MSK") ~ 1,
+    TRUE ~ NA
+  ))
+
+sequenced.samples <- lapply(list.files(
+  path = 'data',
+  pattern = 'cases_sequenced',
+  full.names = TRUE,
+  recursive = TRUE
+),
+function(f) {
+  ids <- read_lines(f) %>%
+    keep(
+      str_detect(., "case_list_ids: ")
+    ) %>%
+    str_remove(., "case_list_ids: ") %>%
+    str_split(., '\t') %>%
+    as_vector()
+  
+  data.frame(SOURCE = basename(dirname(dirname(f))), SAMPLE_ID = ids)
+}) %>%
+  bind_rows()
+
+# The minimum sequencing panel for MSK samples
+panel.341 <-
+  read_lines('data/ref/gene_panels/data_gene_panel_impact341.txt') %>%
+  keep(str_detect(., "gene_list: ")) %>%
+  str_remove(., "gene_list: ") %>%
+  str_split(., '\t') %>%
+  as_vector()
+
+# Panel for PanOrigiMed -- 450 genes
+# Table S1 of https://doi.org/10.1634/theoncologist.2019-0236
+panel.450 <- read_lines("data/ref/450-panel.txt") %>% 
+  str_split('\t') %>% 
+  unlist() %>% 
+  str_remove_all("\"")
+
+geneset.intersect <- intersect(panel.341, panel.450)
+
+samples <- lapply(list.files(
+  path = 'data',
+  pattern = 'data_clinical_sample',
+  full.names = TRUE,
+  recursive = TRUE
+),
+function(f) {
+  read_tsv(f, comment = '#', col_types = cols(.default = 'c')) %>%
+    mutate(SOURCE = basename(dirname(f)), .before = 1)
+}) %>%
+  bind_rows() %>%
+  # Change data types to match usage
+  mutate(across(c(TMB_NONSYNONYMOUS),
+                as.numeric)) %>%
+  mutate(across(where(is.character), ~ . %>% str_squish)) %>%
+  # Filter data to pnet/PANET
+  filter(ONCOTREE_CODE == "PANET" |
+           PATIENT_ID %in% supplemental$Patient_ID) %>%
+  # Remove known NEC patients
+  filter(!(PATIENT_ID %in% (
+    supplemental %>% filter(NET.NEC == 'NEC') %>% pluck('Patient_ID')
+  ))) %>%
+  # Grading is in supplemental
+  rename(RAW_GRADE = GRADE) %>%
+  left_join(
+    supplemental %>% select(
+      PATIENT_ID = Patient_ID,
+      SUPP_SAMPLE_ID = Sample_ID,
+      NODE_INVOLVEMENT = Nodal.Involvement,
+      TMN = TMN.Staging,
+      NET.NEC = NET.NEC,
+      METASTATIC = Metastatic,
+      SUPP_SAMPLE_TYPE = Sample.Type,
+      GRADE = Grade.1
+    ) %>%
+      mutate(across(where(is.character), ~ . %>% str_squish)),
+    by = c("PATIENT_ID" = "PATIENT_ID")
+  ) %>%
+  # Add nodal stage based on regional lymph node met for MSK-MET
+  left_join(
+    regional.LN %>%
+      select(SAMPLE_ID = sample_id, met_site_mapped) %>%
+      mutate(REGIONAL_LN = ifelse(
+        str_detect(met_site_mapped, 'regional_lymph'), 1, NA
+      )) %>%
+      select(-met_site_mapped),
+    by = c("SAMPLE_ID" = "SAMPLE_ID")
+  ) %>%
+  group_by(PATIENT_ID) %>%
+  mutate(
+    NODE_INVOLVEMENT = first(na.omit(NODE_INVOLVEMENT)),
+    METASTATIC = first(na.omit(METASTATIC)),
+    REGIONAL_LN = first(na.omit(REGIONAL_LN)),
+    TMN = first(na.omit(TMN))
+  ) %>%
+  slice_max(order_by = TMB_NONSYNONYMOUS,
+            n = 1,
+            with_ties = FALSE) %>%
+  ungroup() %>%
+  # Remove columns that are all NA
+  select_if(function(x) {
+    !all(is.na(x))
+  }) %>%
+  # Impute data
+  mutate(
+    SAMPLE_TYPE = case_when(
+      SOURCE == "panet_shanghai_2013" ~ "Primary",
+      SOURCE == "panet_arcnet_2017" ~ "Primary",
+      SOURCE == "panet_jhu_2011" ~ SUPP_SAMPLE_TYPE,
+      is.na(SAMPLE_TYPE) ~ SUPP_SAMPLE_TYPE,
+      TRUE ~ SAMPLE_TYPE
+    )
+  ) %>%
+  filter(SAMPLE_TYPE %in% c("Primary", "Metastasis")) %>%
+  assert(is_uniq, PATIENT_ID)
+
+patients <- lapply(list.files(
+  path = 'data',
+  pattern = 'data_clinical_patient',
+  full.names = TRUE,
+  recursive = TRUE
+),
+function(f) {
+  read_tsv(f, comment = '#', col_types = cols(.default = 'c')) %>%
+    mutate(SOURCE = basename(dirname(f)), .before = 1)
+}) %>%
+  bind_rows() %>%
+  filter(PATIENT_ID %in% samples$PATIENT_ID) %>%
+  group_by(PATIENT_ID) %>%
+  # Take the first non-NA value -- merging data that is in separate rows
+  summarise_all( ~ first(na.omit(.))) %>%
+  # Remove columns that are all NA
+  select_if(function(x) {
+    !all(is.na(x))
+  }) %>%
+  # Change data types to match usage
+  mutate(across(
+    c(
+      AGE,
+      OS_MONTHS,
+      AGE_AT_EVIDENCE_OF_METS,
+      AGE_AT_SEQUENCING,
+      AGE_AT_DEATH,
+      AGE_AT_LAST_CONTACT,
+      AGE_AT_SURGERY
+    ),
+    as.numeric
+  )) %>%
+  mutate(across(c(OS_STATUS),
+                ~ ifelse(str_detect(., "1"), "DECEASED", "LIVING"))) %>%
+  mutate(N_STAGE = as.factor(as.numeric(N_STAGE))) %>%
+  mutate(
+    RACE = case_when(
+      SOURCE %in% c("pan_origimed_2020") ~ "Asian",
+      str_detect(RACE, "Caucasian") ~ "White",
+      str_detect(RACE, "Black") ~ "Black",
+      str_detect(RACE, "Asian") ~ "Asian",
+      str_detect(
+        str_to_title(RACE),
+        "Not Documented|No Value Entered|Pt Refused To Answer"
+      ) ~ NA_character_,
+      str_detect(ETHNICITY, 'Asian') ~ "Asian",
+      str_detect(ETHNICITY, 'Black') ~ "Black",
+      str_detect(ETHNICITY, 'Asian') ~ "Asian",
+      str_detect(ETHNICITY, 'White') ~ "White",
+      str_detect(
+        str_to_title(ETHNICITY),
+        "Not Documented|No Value Entered|Pt Refused To Answer"
+      ) ~ NA_character_,
+      !is.na(RACE) ~ str_to_title(RACE),!is.na(ETHNICITY) ~ str_to_title(ETHNICITY)
+    ), 
+    COUNTRY = case_when(
+      !is.na(COUNTRY) ~ COUNTRY,
+      SOURCE %in% c("panet_shanghai_2013", "pan_origimed_2020") ~ "China",
+      SOURCE %in% c(
+        "panet_jhu_2011",
+        "panet_msk_erc_2023",
+        "msk_impact_2017",
+        "msk_met_2021",
+        "metastatic_solid_tumors_mich_2017"
+      ) ~ "United States of America",
+    )
+  ) %>%
+  mutate(OS_MONTHS = dmonths(as.numeric(OS_MONTHS)) %/% dmonths(1)) %>%
+  assert(is_uniq, PATIENT_ID) %>%
+  select(-SOURCE)
+
+mutations <- lapply(list.files(
+  path = 'data',
+  pattern = 'data_mutations',
+  full.names = TRUE,
+  recursive = TRUE
+), function(f) {
+  read_tsv(f, comment = '#', col_types = cols(.default = 'c')) %>%
+    mutate(SOURCE = basename(dirname(f)), .before = 1)
+}) %>% 
+  bind_rows() %>%
+  mutate(
+    Variant_Classification = case_when(
+      str_detect(Variant_Classification, "Frame_Shift") ~ "Frame Shift",
+      str_detect(Variant_Classification, "In_Frame") ~ "In Frame",
+      TRUE ~ str_replace(Variant_Classification, "_", " ")
+    )
+  ) %>%
+  # Remove columns that are all NA
+  select_if(function(x) {
+    !all(is.na(x))
+  }) %>%
+  # Select only the intersection of gene panels
+  filter(Hugo_Symbol %in% geneset.intersect) %>%
+  filter(Tumor_Sample_Barcode %in% samples$SAMPLE_ID) %>%
+  # Add WT samples
+  full_join(
+    sequenced.samples %>%
+      filter(SAMPLE_ID %in% samples$SAMPLE_ID) %>%
+      rename(Tumor_Sample_Barcode = SAMPLE_ID)
+  ) %>%
+  read.maf(
+    vc_nonSyn = vc_nonSyn,
+    clinicalData = samples %>%
+      rename(Tumor_Sample_Barcode = SAMPLE_ID)
+  )
+
+binary.mutations <- mutations@data %>%
+  select(Hugo_Symbol, Tumor_Sample_Barcode, SOURCE) %>%
+  pivot_wider(
+    id_cols = c(SOURCE, Tumor_Sample_Barcode),
+    names_from = Hugo_Symbol,
+    values_from = Hugo_Symbol,
+    values_fn = ~ TRUE
+  ) %>%
+  rename(SAMPLE_ID = Tumor_Sample_Barcode) %>% 
+  # Add the remaining couple WT samples
+  bind_rows(
+    sequenced.samples %>%
+      filter(!(SAMPLE_ID %in% mutations@data$Tumor_Sample_Barcode)) %>%
+      semi_join(
+        samples %>% select(SAMPLE_ID, SOURCE)
+      )
+  ) %>%
+  pivot_longer(
+    cols = -c(SOURCE, SAMPLE_ID),
+    names_to = 'GENE',
+    values_to = 'MUT'
+  )  %>%
+  # Due to limiting to the MSK-IMPACT 341 genepanel, all genes are either mutated or WT
+  # This fills in missing values with FALSE (which here indicated WT)
+  mutate(MUT = !is.na(MUT)) %>%
+  pivot_wider(
+    id_cols = c(SOURCE, SAMPLE_ID),
+    names_from = GENE,
+    values_from = MUT
+  ) %>%
+  relocate(SOURCE, SAMPLE_ID, sort(names(.))) %>%
+  # Collapse data on multi-sequenced samples
+  group_by(SAMPLE_ID, SOURCE) %>%
+  summarise_all(~ first(na.omit(.))) %>%
+  group_by(SAMPLE_ID) %>%
+  # Take the first non-NA value -- merging data that is in separate rows
+  mutate(across(c(-SOURCE), ~ first(na.omit(.)))) %>%
+  ungroup() %>%
+  # Add those genes in the genepanel intersection that are WT across all samples
+  bind_cols(
+    data.frame(
+      GENES =  setdiff(geneset.intersect, mutations@data$Hugo_Symbol),
+      VALUES  = FALSE
+    ) %>%
+      pivot_wider(names_from = GENES, values_from = VALUES)
+  ) %>%
+  mutate(across(setdiff(geneset.intersect, colnames(.)), ~ FALSE))
+
+all.data <- samples %>%
+  left_join(patients,
+            by = c("PATIENT_ID" = "PATIENT_ID")) %>%
+  # Determine MEN1 mutation status
+  inner_join(
+    binary.mutations %>%
+      select(SAMPLE_ID, MEN1, ATRX, DAXX, SMAD4, TP53, KRAS, TSC2, PTEN, ATM),
+    by = c("SAMPLE_ID" = "SAMPLE_ID"),
+  ) %>%
+  mutate(N_STAGE = factor(
+    case_when(
+      !is.na(N_STAGE) ~ as.character(N_STAGE),
+      is.na(N_STAGE) &
+        !is.na(REGIONAL_LN) ~ as.character(REGIONAL_LN),
+      is.na(N_STAGE) &
+        !is.na(NODE_INVOLVEMENT) ~ as.character(NODE_INVOLVEMENT),
+      TRUE ~ NA_character_
+    )
+  ),
+  M_STAGE = factor(
+    case_when(
+      !is.na(M_STAGE) ~ as.character(M_STAGE),
+      is.na(M_STAGE) &
+        !is.na(METASTATIC) ~ as.character(METASTATIC),
+      is.na(M_STAGE) & !is.na(METASTATIC_SITE) & (METASTATIC_SITE != "Not Applicable") ~ "1",
+      is.na(M_STAGE) &
+        !is.na(IS_DIST_MET_MAPPED) ~ as.character(as.numeric(as.logical(IS_DIST_MET_MAPPED))),
+      is.na(M_STAGE) & !is.na(BIOPSY_SITE) ~ "1",
+      is.na(M_STAGE) & (SAMPLE_TYPE == "Metastasis") ~ "1",
+      TRUE ~ NA_character_
+    )
+  )) %>%
+  mutate(SAMPLE_TYPE = factor(SAMPLE_TYPE)) %>%
+  # Denote the groups of interest
+  mutate(
+    Subset_Primary = SAMPLE_TYPE == "Primary",
+    Subset_Metastasis = SAMPLE_TYPE == "Metastasis"
+  ) %>%
+  # Definitive classifications
+  mutate(
+    # Our Classifications
+    ### ADM Mutant: (ATRX or DAXX mutant) AND (MEN1 Mutant)
+    Subset_Our_ADM.MUT = (ATRX | DAXX) & MEN1,
+    ### ADM WT: (ATRX WT) AND (DAXX WT) AND (MEN1 WT)
+    Subset_Our_ADM.WT = !ATRX & !DAXX & !MEN1,
+    ### AD+/M-: (ATRX or DAXX mutant) AND (MEN1 WT)
+    Subset_Our_AD.MUT_M.WT = (ATRX | DAXX) & !MEN1,
+    ### AD-/M+: (ATRX WT) AND (DAXX WT) AND (MEN1 Mutant)
+    Subset_Our_AD.WT_M.MUT = !ATRX & !DAXX & MEN1,
+    ### TP53/KRAS/SMAD4: (TP53 OR KRAS OR SMAD4 Mutant)
+    Subset_Our_TKS = (TP53 | KRAS | SMAD4),
+    # Fica Classifications
+    ### PanNEN1: (MEN1 Mutant) AND (ATRX WT) AND (DAXX WT)
+    Subset_Fica_PanNEN1 = MEN1 & !ATRX & !DAXX,
+    ### PanNEN2: (MEN1 Mutant) AND (ATRX or DAXX Mutant)
+    Subset_Fica_PanNEN2 = MEN1 & (ATRX | DAXX),
+    ### PanNEN4: (MEN1 WT) AND (ATRX or DAXX Mutant)
+    Subset_Fica_PanNEN4 = !MEN1 & (ATRX | DAXX)
+  ) %>%
+  rowwise() %>%
+  mutate(
+    # Unclassified: everything else
+    Subset_Our_Unclassified = !any(c_across(contains("Subset_Our"))),
+    # PanNEN3/5: everything else
+    Subset_Fica_PanNEN3.5 = !any(c_across(contains("Subset_Fica")))
+  ) %>%
+  mutate(
+    Subset_Our_Unclassified.w.Missing = Subset_Our_Unclassified |
+      sum(replace_na(c_across(
+        contains("Subset_Our")
+      ), replace = FALSE)) == 0,
+    Subset_Fica_PanNEN3.5.w.Missing = Subset_Fica_PanNEN3.5 |
+      sum(replace_na(c_across(
+        contains("Subset_Fica")
+      ), replace = FALSE)) == 0
+  ) %>% 
+  ungroup() %>%
+  # Remove TKS samples from our categories
+  mutate(
+    # Our Classifications
+    ### ADM Mutant: (ATRX or DAXX mutant) AND (MEN1 Mutant)
+    Subset_Our_ADM.MUT = Subset_Our_ADM.MUT & !replace_na(Subset_Our_TKS, FALSE),
+    ### ADM WT: (ATRX WT) AND (DAXX WT) AND (MEN1 WT)
+    Subset_Our_ADM.WT = !ATRX & !DAXX & !MEN1 & !replace_na(Subset_Our_TKS, FALSE),
+    ### AD+/M-: (ATRX or DAXX mutant) AND (MEN1 WT)
+    Subset_Our_AD.MUT_M.WT = (ATRX | DAXX) & !MEN1 & !replace_na(Subset_Our_TKS, FALSE),
+    ### AD-/M+: (ATRX WT) AND (DAXX WT) AND (MEN1 Mutant)
+    Subset_Our_AD.WT_M.MUT = !ATRX & !DAXX & MEN1 & !replace_na(Subset_Our_TKS, FALSE)
+  ) %>%
+  verify(
+    sum(
+      Subset_Our_ADM.MUT |
+        Subset_Our_ADM.WT |
+        Subset_Our_AD.MUT_M.WT |
+        Subset_Our_AD.WT_M.MUT |
+        Subset_Our_TKS |
+        Subset_Our_Unclassified.w.Missing
+    ) == nrow(.)
+  ) %>%
+  verify(
+    sum(
+      Subset_Fica_PanNEN1 |
+        Subset_Fica_PanNEN2 |
+        Subset_Fica_PanNEN4 |
+        Subset_Fica_PanNEN3.5.w.Missing
+    ) == nrow(.)
+  )
+```
+
+## Manuscript Figures
+### Figure 1
+#### Figure 1A
+```{r}
+tmp <- all.data %>%
+  select(SAMPLE_ID, SAMPLE_TYPE) %>%
+  left_join(
+    mutations@data %>%
+      select(Hugo_Symbol, SAMPLE_ID = Tumor_Sample_Barcode, Variant_Classification),
+    by = c('SAMPLE_ID' = 'SAMPLE_ID')
+  ) %>%
+  filter(!is.na(Variant_Classification)) %>%
+  count(SAMPLE_TYPE, Variant_Classification) %>%
+  mutate(SAMPLE_TYPE = fct_relevel(SAMPLE_TYPE, c("Primary", "Metastasis")))
+
+ggplot(tmp) +
+  aes(x = SAMPLE_TYPE, y = n, fill = Variant_Classification) +
+  geom_bar(position = "fill", stat = "identity") +
+  labs(
+    title = "Sample Type: Variant Classification",
+    x = "Sample Type",
+    y = "Frequency",
+    fill = "Variant Classification"
+  ) +
+  scale_y_continuous(labels = scales::percent)
+
+tmp %>%
+  acast(SAMPLE_TYPE ~ Variant_Classification, value.var = 'n') %>%
+  chisq.test()
+
+tmp %>% 
+  group_by(SAMPLE_TYPE) %>% 
+  mutate(Percentage = prop.table(n))
+```
+
+#### Figure 1B
+
+```{r}
+all.data %>%
+  ggplot() +
+  aes(x = SAMPLE_TYPE, y = TMB_NONSYNONYMOUS, fill = SAMPLE_TYPE) +
+  stat_summary(fun.data = \(x) {
+    r <- quantile(x, probs=c(0, 0.05, 0.5, 0.95, 1))
+    names(r) <- c("ymin", "lower", "middle", "upper", "ymax")
+  r
+    }, geom="boxplot") +
+  labs(
+    title = "Sample Type: TMB",
+    x = "Sample Type",
+    y = bquote('Mutations/'~10^6~"Bases")
+  ) +
+  theme(
+    legend.position = "none"
+  )
+
+all.data %>%
+  t.test(TMB_NONSYNONYMOUS ~ SAMPLE_TYPE,
+         var.equal = TRUE,
+         data = .)
+
+all.data %>%
+  wilcox.test(TMB_NONSYNONYMOUS ~ SAMPLE_TYPE,
+              var.equal = TRUE,
+              data = .)
+```
+
+#### Figure 1C
+```{r, message=FALSE}
+primaries <- mutations %>%
+  subsetMaf(tsb = all.data %>%
+                        filter(Subset_Primary) %>%
+                        pluck("SAMPLE_ID") %>%
+                        unique())
+mets <- mutations %>%
+  subsetMaf(tsb = all.data %>%
+                        filter(Subset_Metastasis) %>%
+                        pluck("SAMPLE_ID") %>%
+                        unique())
+tmp <- mafCompare(primaries,
+                  mets,
+                  m1Name = "Primary",
+                  m2Name = "Metastasis",
+                  minMut = 0)
+
+penetrant.genes.primary <- tmp$results %>%
+  mutate(Primary = Primary / {
+    all.data %>%
+      filter(Subset_Primary) %>%
+      pluck("SAMPLE_ID") %>%
+      unique() %>% length()
+  }) %>%
+  select(Hugo_Symbol, Primary) %>%
+  filter(Primary > penetrance) %>%
+  pluck('Hugo_Symbol')
+penetrant.genes.mets <- tmp$results %>%
+  mutate(Metastasis = Metastasis / {
+    all.data %>%
+      filter(Subset_Metastasis) %>%
+      pluck("SAMPLE_ID") %>%
+      unique() %>% length()
+  }) %>%
+  select(Hugo_Symbol, Metastasis) %>%
+  filter(Metastasis > penetrance) %>%
+  pluck('Hugo_Symbol')
+
+penetrant.genelist <- unique(c(penetrant.genes.primary, penetrant.genes.mets))
+
+tmp$table <- tmp$results %>%
+    mutate(Primary = Primary / {
+    all.data %>%
+      filter(Subset_Primary) %>%
+      pluck("SAMPLE_ID") %>%
+      unique() %>% length()
+  }, Metastasis = Metastasis / {
+    all.data %>%
+      filter(Subset_Metastasis) %>%
+      pluck("SAMPLE_ID") %>%
+      unique() %>% length()
+  }) %>%
+  select(Hugo_Symbol, Primary, Metastasis, pval) %>%
+  filter(Hugo_Symbol %in% penetrant.genelist) %>% 
+  arrange(desc(Primary))
+
+fig1c.order <- tmp$table$Hugo_Symbol
+
+gt(tmp$table) %>%
+  cols_label(
+    Hugo_Symbol = "Gene",
+    Primary = "Primaries",
+    Metastasis = "Metastases",
+    pval = "p-value"
+  ) %>%
+  fmt_percent(columns = c("Primary", "Metastasis"),
+              decimals = 1) %>%
+  fmt(
+    columns = `pval`,
+    fns = function(p)
+      gtsummary::style_pvalue(p, decimals = 3)
+  ) %>%
+  tab_style(
+    style = list(cell_text(weight = 'bold')),
+    locations = cells_body(columns = everything(), rows = `pval` < 0.05)
+  ) %>%
+  tab_footnote(
+    footnote = "Fisher's exact test",
+    locations = cells_column_labels(columns = pval)
+  ) %>%
+  opt_stylize(style = 1, color = 'gray') %>%
+  opt_table_font(font = 'Arial') %>%
+  tab_header(title = "Sample Type: Somatic Mutational Frequencies")
+```
+
+#### Figure 1D
+```{r, fig.height=8.5/1.5, fig.width=11/1.5, fig.ext=c('png', 'pdf')}
+features <- all.data %>%
+  select(SAMPLE_ID, SAMPLE_TYPE) %>%
+  filter(!is.na(SAMPLE_TYPE)) %>%
+  left_join(binary.mutations, by = c('SAMPLE_ID' = 'SAMPLE_ID')) %>%
+  select(SAMPLE_TYPE, tidyr::all_of(sort(penetrant.genelist))) %>%
+  mutate(across(where(is.logical), as.numeric)) %>%
+  mutate(SAMPLE_TYPE = ifelse(SAMPLE_TYPE == 'Metastasis', 1, 0)) %>%
+  select(SAMPLE_TYPE, fig1c.order)
+
+model.full <- glm(SAMPLE_TYPE ~ .,
+                  family = binomial(link = 'logit'),
+                  data = features)
+model.reduced <- model.full %>% reduceModel()
+
+panels <- list(
+  list(width = 0.03),
+  list(
+    width = 0.1,
+    display = ~ variable,
+    heading = "Gene"
+  ),
+  list(width = 0.1, display = ~ level),
+  list(
+    width = 0.05,
+    display = ~ n,
+    hjust = 1,
+    heading = "Total"
+  ),
+  list(
+    width = 0.03,
+    item = "vline",
+    hjust = 0.5
+  ),
+  list(
+    width = 0.55,
+    item = "forest",
+    hjust = 0.5,
+    heading = "Odds Ratio",
+    linetype = "dashed",
+    line_x = 0
+  ),
+  list(
+    width = 0.03,
+    item = "vline",
+    hjust = 0.5
+  ),
+  list(
+    width = 0.12,
+    display = ~ ifelse(
+      reference,
+      "Reference",
+      sprintf(
+        "%0.2f (%0.2f, %0.2f)",
+        trans(estimate),
+        trans(conf.low),
+        trans(conf.high)
+      )
+    ),
+    display_na = NA
+  ),
+  list(
+    width = 0.05,
+    display = ~ ifelse(reference, "", format.pval(
+      p.value, digits = 1, eps = 0.001
+    )),
+    display_na = NA,
+    hjust = 1,
+    heading = "p-value"
+  ),
+  list(width = 0.03)
+)
+
+forest_model(
+  model.reduced,
+  recalculate_width = TRUE,
+  recalculate_height = FALSE,
+  format_options = list(point_size = 3, text_size = 6),
+  panels = panels
+) +
+  labs(caption = "Rightward is increased mutation rate in metastases compared to primaries. OR (5% CI, 95% CI)") +
+  theme(
+    axis.text.x = element_text(
+      angle = 90,
+      vjust = 0.5,
+      hjust = 1
+    )
+  )
+ggsave("Fig1D-normal.pdf")
+```
+
+### Figure 2
+#### Figure 2A
+```{r, message=FALSE, , fig.ext=c('png', 'pdf')}
+.samples <- all.data %>%
+  filter(Subset_Primary) %>%
+  pluck("SAMPLE_ID") %>%
+  unique()
+
+mutations %>%
+  subsetMaf(tsb = .samples) %>%
+  oncoplot(
+    cohortSize = length(.samples),
+    titleText = "Primary Tumors: Non-Synonmous Mutations",
+    colors = c(
+      "Frame Shift" = "#bbde93",
+      "Splice Site" = "#aecde1",
+      "Nonsense Mutation" = "#549e3f",
+      "In Frame" = "#ee9f96",
+      "Missense Mutation" = "#3c76af",
+      "Multi_Hit" = "#000000"
+    )
+  )
+```
+
+#### Figure 2B
+```{r, message=FALSE, fig.ext=c('png', 'pdf')}
+.samples <- all.data %>%
+  filter(Subset_Metastasis) %>%
+  pluck("SAMPLE_ID") %>%
+  unique()
+
+mutations %>%
+  subsetMaf(tsb = .samples) %>%
+  oncoplot(
+    cohortSize = length(.samples),
+    titleText = "Metastatic Tumors: Non-Synonmous Mutations",
+    colors = c(
+      "Frame Shift" = "#bbde93",
+      "Splice Site" = "#aecde1",
+      "Nonsense Mutation" = "#549e3f",
+      "In Frame" = "#ee9f96",
+      "Missense Mutation" = "#3c76af",
+      "Multi_Hit" = "#000000"
+    )
+  )
+```
+
+### Figure 3
+```{r}
+penetrant.dfs <- list()
+penetrant.dfs$Subset_Primary <- all.data %>%
+      filter(Subset_Primary) %>%
+      select(SAMPLE_ID, SOURCE) %>%
+      left_join(binary.mutations,
+                by = c("SAMPLE_ID" = "SAMPLE_ID", "SOURCE" = "SOURCE")) %>%
+      column_to_rownames("SAMPLE_ID") %>%
+      select(all_of(penetrant.genes.primary))
+penetrant.dfs$Subset_Metastasis <- all.data %>%
+      filter(Subset_Metastasis) %>%
+      select(SAMPLE_ID, SOURCE) %>%
+      left_join(binary.mutations,
+                by = c("SAMPLE_ID" = "SAMPLE_ID", "SOURCE" = "SOURCE")) %>%
+      column_to_rownames("SAMPLE_ID") %>%
+      select(all_of(penetrant.genes.mets))
+
+mutex.dfs <- lapply(penetrant.dfs %>% keep(~ all(dim(.) > c(1, 1))), function(df) {
+  factor.df <- df %>%
+    mutate(across(everything(), ~ factor(
+      ifelse(., "MUT", "WT"), , levels = c("MUT", "WT")
+    ))) %>%
+    # Alphabetize columns
+    select(order(colnames(.))) 
+  
+  expand.grid(Gene1 = colnames(factor.df), Gene2 = colnames(factor.df)) %>%
+    filter(Gene1 != Gene2) %>%
+    rowwise() %>%
+    mutate(
+      p.value = fisher.test(factor.df[[Gene1]], factor.df[[Gene2]])$p.value,
+      odds = fisher.test(factor.df[[Gene1]], factor.df[[Gene2]])$estimate
+    ) %>%
+    mutate(
+      Z = sign(-log2(odds)) * p.to.Z(p.value) # Z of p-value with direction sign
+    ) %>%
+    ungroup()
+})
+```
+
+#### Figure 3A
+```{r}
+z.mat <- mutex.dfs$Subset_Primary %>% 
+  acast(Gene1 ~ Gene2, value.var = "Z")
+z.mat[z.mat == -0] <- 0
+ComplexHeatmap::pheatmap(
+  z.mat,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  name = 'Z-score',
+  display_numbers = apply(z.mat, c(1, 2), function (x)
+    sprintf("%.2f", x) %>% ifelse(. == "NA", "", .)),
+  main = "Primary Samples: Variant Association",
+  col = mutex.colors
+)
+```
+
+#### Figure 3B
+```{r}
+z.mat <- mutex.dfs$Subset_Metastasis %>%
+  acast(Gene1 ~ Gene2, value.var = "Z")
+z.mat[z.mat == -0] <- 0
+ComplexHeatmap::pheatmap(
+  z.mat,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  name = 'Z-score',
+  display_numbers = apply(z.mat, c(1, 2), function (x)
+    sprintf("%.2f", x) %>% ifelse(. == "NA", "", .)),
+  main = "Metastases Samples: Variant Association",
+  col = mutex.colors
+)
+```
+
+### Figure 4
+#### Figure 4B
+```{r}
+primaries.pnen1 <- mutations %>%
+  subsetMaf(
+    tsb = all.data %>%
+      filter(Subset_Primary &
+               Subset_Fica_PanNEN1) %>%
+      pluck("SAMPLE_ID") %>%
+      unique()
+  )
+mets.pnen1 <- mutations %>%
+  subsetMaf(
+    tsb = all.data %>%
+      filter(Subset_Metastasis &
+               Subset_Fica_PanNEN1) %>%
+      pluck("SAMPLE_ID") %>%
+      unique()
+  )
+tmp <- mafCompare(
+  primaries.pnen1,
+  mets.pnen1,
+  m1Name = "Primary",
+  m2Name = "Metastasis",
+  minMut = 0
+)
+
+tmp.df <- tmp$results %>%
+  mutate(Primary = Primary / {
+    all.data %>%
+      filter(Subset_Primary & Subset_Fica_PanNEN1) %>%
+      pluck("SAMPLE_ID") %>%
+      unique() %>% length()
+  }, Metastasis = Metastasis / {
+    all.data %>%
+      filter(Subset_Metastasis & Subset_Fica_PanNEN1) %>%
+      pluck("SAMPLE_ID") %>%
+      unique() %>% length()
+  }) %>%
+  select(Hugo_Symbol, Primary, Metastasis, pval) %>%
+  filter(Primary > penetrance | Metastasis > penetrance) %>%
+  arrange(pval)
+
+ggplot(tmp.df) +
+  aes(x = Primary, y = Metastasis, label = Hugo_Symbol) +
+  geom_abline(intercept = 0, slope = 1, linetype = 'dotted') +
+  geom_point(color = "black", data = . %>% filter(pval > 0.05)) +
+  geom_point(color = "red", data = . %>% filter(pval <= 0.05)) +
+  geom_label_repel(data = . %>% filter(pval <= 0.05)) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  scale_x_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(
+    title = "PanNEN1",
+    x = "Primaries",
+    y = "Metastases"
+  ) + 
+  theme(aspect.ratio=1)
+
+gt(tmp.df) %>%
+  cols_label(
+    Hugo_Symbol = "Gene",
+    Primary = "Primaries",
+    Metastasis = "Metastases",
+    pval = "p-value"
+  ) %>%
+  fmt_percent(columns = c("Primary", "Metastasis"),
+              decimals = 1) %>%
+  fmt(
+    columns = `pval`,
+    fns = function(p)
+      gtsummary::style_pvalue(p, decimals = 3)
+  ) %>%
+  tab_style(
+    style = list(cell_text(weight = 'bold')),
+    locations = cells_body(columns = `pval`, rows = `pval` < 0.05)
+  ) %>%
+  opt_stylize(style = 1, color = 'gray') %>%
+  opt_table_font(font = 'Arial') %>%
+  tab_header(title = "PanNEN1: Somatic Mutational Frequencies")
+```
+
+#### Figure 4C
+```{r}
+primaries.pnen2 <- mutations %>%
+  subsetMaf(
+    tsb = all.data %>%
+      filter(Subset_Primary &
+               Subset_Fica_PanNEN2) %>%
+      pluck("SAMPLE_ID") %>%
+      unique()
+  )
+mets.pnen2 <- mutations %>%
+  subsetMaf(
+    tsb = all.data %>%
+      filter(Subset_Metastasis &
+               Subset_Fica_PanNEN2) %>%
+      pluck("SAMPLE_ID") %>%
+      unique()
+  )
+tmp <- mafCompare(
+  primaries.pnen2,
+  mets.pnen2,
+  m1Name = "Primary",
+  m2Name = "Metastasis",
+  minMut = 0
+)
+
+tmp.df <- tmp$results %>%
+  mutate(Primary = Primary / {
+    all.data %>%
+      filter(Subset_Primary & Subset_Fica_PanNEN2) %>%
+      pluck("SAMPLE_ID") %>%
+      unique() %>% length()
+  }, Metastasis = Metastasis / {
+    all.data %>%
+      filter(Subset_Metastasis & Subset_Fica_PanNEN2) %>%
+      pluck("SAMPLE_ID") %>%
+      unique() %>% length()
+  }) %>%
+  select(Hugo_Symbol, Primary, Metastasis, pval) %>%
+  filter(Primary > penetrance | Metastasis > penetrance) %>%
+  arrange(pval)
+
+ggplot(tmp.df) +
+  aes(x = Primary, y = Metastasis, label = Hugo_Symbol) +
+  geom_abline(intercept = 0, slope = 1, linetype = 'dotted') +
+  geom_point(color = "black", data = . %>% filter(pval > 0.05)) +
+  geom_point(color = "red", data = . %>% filter(pval <= 0.05)) +
+  geom_label_repel(data = . %>% filter(pval <= 0.05)) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  scale_x_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(
+    title = "PanNEN2",
+    x = "Primaries",
+    y = "Metastases"
+  ) + 
+  theme(aspect.ratio=1)
+
+gt(tmp.df) %>%
+  cols_label(
+    Hugo_Symbol = "Gene",
+    Primary = "Primaries",
+    Metastasis = "Metastases",
+    pval = "p-value"
+  ) %>%
+  fmt_percent(columns = c("Primary", "Metastasis"),
+              decimals = 1) %>%
+  fmt(
+    columns = `pval`,
+    fns = function(p)
+      gtsummary::style_pvalue(p, decimals = 3)
+  ) %>%
+  tab_style(
+    style = list(cell_text(weight = 'bold')),
+    locations = cells_body(columns = `pval`, rows = `pval` < 0.05)
+  ) %>%
+  opt_stylize(style = 1, color = 'gray') %>%
+  opt_table_font(font = 'Arial') %>%
+  tab_header(title = "PanNEN2: Somatic Mutational Frequencies")
+```
+
+#### Figure 4D
+```{r}
+primaries.pnen4 <- mutations %>%
+  subsetMaf(
+    tsb = all.data %>%
+      filter(Subset_Primary &
+               Subset_Fica_PanNEN4) %>%
+      pluck("SAMPLE_ID") %>%
+      unique()
+  )
+mets.pnen4 <- mutations %>%
+  subsetMaf(
+    tsb = all.data %>%
+      filter(Subset_Metastasis &
+               Subset_Fica_PanNEN4) %>%
+      pluck("SAMPLE_ID") %>%
+      unique()
+  )
+tmp <- mafCompare(
+  primaries.pnen4,
+  mets.pnen4,
+  m1Name = "Primary",
+  m2Name = "Metastasis",
+  minMut = 0
+)
+
+tmp.df <- tmp$results %>%
+  mutate(Primary = Primary / {
+    all.data %>%
+      filter(Subset_Primary & Subset_Fica_PanNEN4) %>%
+      pluck("SAMPLE_ID") %>%
+      unique() %>% length()
+  }, Metastasis = Metastasis / {
+    all.data %>%
+      filter(Subset_Metastasis & Subset_Fica_PanNEN4) %>%
+      pluck("SAMPLE_ID") %>%
+      unique() %>% length()
+  }) %>%
+  select(Hugo_Symbol, Primary, Metastasis, pval) %>%
+  filter(Primary > penetrance | Metastasis > penetrance) %>%
+  arrange(pval)
+
+ggplot(tmp.df) +
+  aes(x = Primary, y = Metastasis, label = Hugo_Symbol) +
+  geom_abline(intercept = 0, slope = 1, linetype = 'dotted') +
+  geom_point(color = "black", data = . %>% filter(pval > 0.05)) +
+  geom_point(color = "red", data = . %>% filter(pval <= 0.05)) +
+  geom_label_repel(data = . %>% filter(pval <= 0.05)) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  scale_x_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(
+    title = "PanNEN4",
+    x = "Primaries",
+    y = "Metastases"
+  ) + 
+  theme(aspect.ratio=1)
+
+gt(tmp.df) %>%
+  cols_label(
+    Hugo_Symbol = "Gene",
+    Primary = "Primaries",
+    Metastasis = "Metastases",
+    pval = "p-value"
+  ) %>%
+  fmt_percent(columns = c("Primary", "Metastasis"),
+              decimals = 1) %>%
+  fmt(
+    columns = `pval`,
+    fns = function(p)
+      gtsummary::style_pvalue(p, decimals = 3)
+  ) %>%
+  tab_style(
+    style = list(cell_text(weight = 'bold')),
+    locations = cells_body(columns = `pval`, rows = `pval` < 0.05)
+  ) %>%
+  opt_stylize(style = 1, color = 'gray') %>%
+  opt_table_font(font = 'Arial') %>%
+  tab_header(title = "PanNEN4: Somatic Mutational Frequencies")
+```
+
+#### Figure 4E
+```{r}
+primaries.pnen3.5 <- mutations %>%
+  subsetMaf(
+    tsb = all.data %>%
+      filter(Subset_Primary &
+               Subset_Fica_PanNEN3.5) %>%
+      pluck("SAMPLE_ID") %>%
+      unique()
+  )
+mets.pnen3.5 <- mutations %>%
+  subsetMaf(
+    tsb = all.data %>%
+      filter(Subset_Metastasis &
+               Subset_Fica_PanNEN3.5) %>%
+      pluck("SAMPLE_ID") %>%
+      unique()
+  )
+tmp <- mafCompare(
+  primaries.pnen3.5,
+  mets.pnen3.5,
+  m1Name = "Primary",
+  m2Name = "Metastasis",
+  minMut = 0
+)
+
+tmp.df <- tmp$results %>%
+  mutate(Primary = Primary / {
+    all.data %>%
+      filter(Subset_Primary & Subset_Fica_PanNEN3.5) %>%
+      pluck("SAMPLE_ID") %>%
+      unique() %>% length()
+  }, Metastasis = Metastasis / {
+    all.data %>%
+      filter(Subset_Metastasis & Subset_Fica_PanNEN3.5) %>%
+      pluck("SAMPLE_ID") %>%
+      unique() %>% length()
+  }) %>%
+  select(Hugo_Symbol, Primary, Metastasis, pval) %>%
+  filter(Primary > penetrance | Metastasis > penetrance) %>%
+  arrange(pval)
+
+ggplot(tmp.df) +
+  aes(x = Primary, y = Metastasis, label = Hugo_Symbol) +
+  geom_abline(intercept = 0, slope = 1, linetype = 'dotted') +
+  geom_point(color = "black", data = . %>% filter(pval > 0.05)) +
+  geom_point(color = "red", data = . %>% filter(pval <= 0.05)) +
+  geom_label_repel(data = . %>% filter(pval <= 0.05)) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  scale_x_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(
+    title = "PanNEN3/5",
+    x = "Primaries",
+    y = "Metastases"
+  ) + 
+  theme(aspect.ratio=1)
+
+gt(tmp.df) %>%
+  cols_label(
+    Hugo_Symbol = "Gene",
+    Primary = "Primaries",
+    Metastasis = "Metastases",
+    pval = "p-value"
+  ) %>%
+  fmt_percent(columns = c("Primary", "Metastasis"),
+              decimals = 1) %>%
+  fmt(
+    columns = `pval`,
+    fns = function(p)
+      gtsummary::style_pvalue(p, decimals = 3)
+  ) %>%
+  tab_style(
+    style = list(cell_text(weight = 'bold')),
+    locations = cells_body(columns = `pval`, rows = `pval` < 0.05)
+  ) %>%
+  opt_stylize(style = 1, color = 'gray') %>%
+  opt_table_font(font = 'Arial') %>%
+  tab_header(title = "PanNEN3/5: Somatic Mutational Frequencies")
+```
+
+#### Figure 4F
+```{r}
+fit <- survfit2(
+    Surv(MONTHS, STATUS) ~ GROUP,
+    data = all.data %>%
+      filter(Subset_Primary) %>%
+      mutate(
+        MONTHS = OS_MONTHS,
+        STATUS = OS_STATUS == "DECEASED",
+        GROUP = case_when(
+          Subset_Fica_PanNEN1 ~ "PanNEN1",
+          Subset_Fica_PanNEN2 ~ "PanNEN2",
+          Subset_Fica_PanNEN4 ~ "PanNEN4",
+          Subset_Fica_PanNEN3.5 ~ "PanNEN3/5",
+        )
+      )
+  )
+
+survminer::pairwise_survdiff(
+  Surv(MONTHS, STATUS) ~ GROUP,
+  data = all.data %>%
+    filter(Subset_Primary) %>%
+    mutate(
+      MONTHS = OS_MONTHS,
+      STATUS = OS_STATUS == "DECEASED",
+      GROUP = case_when(
+        Subset_Fica_PanNEN1 ~ "PanNEN1",
+        Subset_Fica_PanNEN2 ~ "PanNEN2",
+        Subset_Fica_PanNEN4 ~ "PanNEN4",
+        Subset_Fica_PanNEN3.5 ~ "PanNEN3/5",
+      )
+    )
+)
+
+fit %>%
+  ggsurvfit(size = 0.75) +
+  add_pvalue() +
+  labs(
+    title = "Primary Tumors: Overall Survival", 
+    x = "Overall Survival (Months)", 
+    y = "Fractional Survival"
+  ) +
+  scale_x_continuous(breaks = seq(0, 180, 12), limits = c(0, 180)) +
+  ylim(0, 1) +
+  theme(
+    title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "bottom",
+    text = element_text(size = 16, family = "Arial"),
+    axis.text = element_text(size = 14),
+    legend.text = element_text(size = 12)
+  ) +
+  scale_color_manual(
+    values = c(
+      "PanNEN1" = "#339394",
+      "PanNEN2" = "#f0ee13",
+      "PanNEN3/5" = "#8d188f",
+      "PanNEN4" = "#3f50ab"
+    )
+  )
+
+fit
+```
+
+#### Figure 4G
+```{r}
+fit <- survfit2(
+    Surv(MONTHS, STATUS) ~ GROUP,
+    data = all.data %>%
+      filter(Subset_Metastasis) %>%
+      mutate(
+        MONTHS = OS_MONTHS,
+        STATUS = OS_STATUS == "DECEASED",
+        GROUP = case_when(
+          Subset_Fica_PanNEN1 ~ "PanNEN1",
+          Subset_Fica_PanNEN2 ~ "PanNEN2",
+          Subset_Fica_PanNEN4 ~ "PanNEN4",
+          Subset_Fica_PanNEN3.5 ~ "PanNEN3/5",
+        )
+      )
+  )
+
+survminer::pairwise_survdiff(
+  Surv(MONTHS, STATUS) ~ GROUP,
+  data = all.data %>%
+    filter(Subset_Metastasis) %>%
+    mutate(
+      MONTHS = OS_MONTHS,
+      STATUS = OS_STATUS == "DECEASED",
+      GROUP = case_when(
+        Subset_Fica_PanNEN1 ~ "PanNEN1",
+        Subset_Fica_PanNEN2 ~ "PanNEN2",
+        Subset_Fica_PanNEN4 ~ "PanNEN4",
+        Subset_Fica_PanNEN3.5 ~ "PanNEN3/5",
+      )
+    )
+)
+
+fit %>%
+  ggsurvfit(size = 0.75) +
+  add_pvalue() +
+  labs(
+    title = "Metastatic Tumors: Overall Survival", 
+    x = "Overall Survival (Months)", 
+    y = "Fractional Survival"
+  ) +
+  scale_x_continuous(breaks = seq(0, 72, 12), limits = c(0, 72)) +
+  ylim(0, 1) +
+  theme(
+    title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "bottom",
+    text = element_text(size = 16, family = "Arial"),
+    axis.text = element_text(size = 14),
+    legend.text = element_text(size = 12)
+  ) +
+  scale_color_manual(
+    values = c(
+      "PanNEN1" = "#339394",
+      "PanNEN2" = "#f0ee13",
+      "PanNEN3/5" = "#8d188f",
+      "PanNEN4" = "#3f50ab"
+    )
+  )
+
+fit
+```
+
+### Figure 5
+#### Figure 5B
+```{r}
+primaries.m.mut <- mutations %>%
+  subsetMaf(
+    tsb = all.data %>%
+      filter(Subset_Primary &
+               Subset_Our_AD.WT_M.MUT) %>%
+      pluck("SAMPLE_ID") %>%
+      unique()
+  )
+mets.m.mut <- mutations %>%
+  subsetMaf(
+    tsb = all.data %>%
+      filter(Subset_Metastasis &
+               Subset_Our_AD.WT_M.MUT) %>%
+      pluck("SAMPLE_ID") %>%
+      unique()
+  )
+tmp <- mafCompare(
+  primaries.m.mut,
+  mets.m.mut,
+  m1Name = "Primary",
+  m2Name = "Metastasis",
+  minMut = 0
+)
+
+tmp.df <- tmp$results %>%
+  mutate(Primary = Primary / {
+    all.data %>%
+      filter(Subset_Primary & Subset_Our_AD.WT_M.MUT) %>%
+      pluck("SAMPLE_ID") %>%
+      unique() %>% length()
+  }, Metastasis = Metastasis / {
+    all.data %>%
+      filter(Subset_Metastasis & Subset_Our_AD.WT_M.MUT) %>%
+      pluck("SAMPLE_ID") %>%
+      unique() %>% length()
+  }) %>%
+  select(Hugo_Symbol, Primary, Metastasis, pval) %>%
+  filter(Primary > penetrance | Metastasis > penetrance) %>%
+  arrange(pval)
+
+ggplot(tmp.df) +
+  aes(x = Primary, y = Metastasis, label = Hugo_Symbol) +
+  geom_abline(intercept = 0, slope = 1, linetype = 'dotted') +
+  geom_point(color = "black", data = . %>% filter(pval > 0.05)) +
+  geom_point(color = "red", data = . %>% filter(pval <= 0.05)) +
+  geom_label_repel(data = . %>% filter(pval <= 0.05)) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  scale_x_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(
+    title = "MEN1-Mutant",
+    x = "Primaries",
+    y = "Metastases"
+  ) + 
+  theme(aspect.ratio=1)
+
+gt(tmp.df) %>%
+  cols_label(
+    Hugo_Symbol = "Gene",
+    Primary = "Primaries",
+    Metastasis = "Metastases",
+    pval = "p-value"
+  ) %>%
+  fmt_percent(columns = c("Primary", "Metastasis"),
+              decimals = 1) %>%
+  fmt(
+    columns = `pval`,
+    fns = function(p)
+      gtsummary::style_pvalue(p, decimals = 3)
+  ) %>%
+  tab_style(
+    style = list(cell_text(weight = 'bold')),
+    locations = cells_body(columns = `pval`, rows = `pval` < 0.05)
+  ) %>%
+  opt_stylize(style = 1, color = 'gray') %>%
+  opt_table_font(font = 'Arial') %>%
+  tab_header(title = "MEN1-Mutant: Somatic Mutational Frequencies")
+```
+
+#### Figure 5C
+```{r}
+primaries.adm.mut<- mutations %>%
+  subsetMaf(
+    tsb = all.data %>%
+      filter(Subset_Primary &
+               Subset_Our_ADM.MUT) %>%
+      pluck("SAMPLE_ID") %>%
+      unique()
+  )
+mets.adm.mut <- mutations %>%
+  subsetMaf(
+    tsb = all.data %>%
+      filter(Subset_Metastasis &
+               Subset_Our_ADM.MUT) %>%
+      pluck("SAMPLE_ID") %>%
+      unique()
+  )
+tmp <- mafCompare(
+  primaries.adm.mut,
+  mets.adm.mut,
+  m1Name = "Primary",
+  m2Name = "Metastasis",
+  minMut = 0
+)
+
+tmp.df <- tmp$results %>%
+  mutate(Primary = Primary / {
+    all.data %>%
+      filter(Subset_Primary & Subset_Our_ADM.MUT) %>%
+      pluck("SAMPLE_ID") %>%
+      unique() %>% length()
+  }, Metastasis = Metastasis / {
+    all.data %>%
+      filter(Subset_Metastasis & Subset_Our_ADM.MUT) %>%
+      pluck("SAMPLE_ID") %>%
+      unique() %>% length()
+  }) %>%
+  select(Hugo_Symbol, Primary, Metastasis, pval) %>%
+  filter(Primary > penetrance | Metastasis > penetrance) %>%
+  arrange(pval)
+
+ggplot(tmp.df) +
+  aes(x = Primary, y = Metastasis, label = Hugo_Symbol) +
+  geom_abline(intercept = 0, slope = 1, linetype = 'dotted') +
+  geom_point(color = "black", data = . %>% filter(pval > 0.05)) +
+  geom_point(color = "red", data = . %>% filter(pval <= 0.05)) +
+  geom_label_repel(data = . %>% filter(pval <= 0.05)) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  scale_x_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(
+    title = "ADM-Mutant",
+    x = "Primaries",
+    y = "Metastases"
+  ) + 
+  theme(aspect.ratio=1)
+
+gt(tmp.df) %>%
+  cols_label(
+    Hugo_Symbol = "Gene",
+    Primary = "Primaries",
+    Metastasis = "Metastases",
+    pval = "p-value"
+  ) %>%
+  fmt_percent(columns = c("Primary", "Metastasis"),
+              decimals = 1) %>%
+  fmt(
+    columns = `pval`,
+    fns = function(p)
+      gtsummary::style_pvalue(p, decimals = 3)
+  ) %>%
+  tab_style(
+    style = list(cell_text(weight = 'bold')),
+    locations = cells_body(columns = `pval`, rows = `pval` < 0.05)
+  ) %>%
+  opt_stylize(style = 1, color = 'gray') %>%
+  opt_table_font(font = 'Arial') %>%
+  tab_header(title = "ADM-Mutant: Somatic Mutational Frequencies")
+```
+
+#### Figure 5D
+```{r}
+primaries.ad.mut <- mutations %>%
+  subsetMaf(
+    tsb = all.data %>%
+      filter(Subset_Primary &
+               Subset_Our_AD.MUT_M.WT) %>%
+      pluck("SAMPLE_ID") %>%
+      unique()
+  )
+mets.ad.mut <- mutations %>%
+  subsetMaf(
+    tsb = all.data %>%
+      filter(Subset_Metastasis &
+               Subset_Our_AD.MUT_M.WT) %>%
+      pluck("SAMPLE_ID") %>%
+      unique()
+  )
+tmp <- mafCompare(
+  primaries.ad.mut,
+  mets.ad.mut,
+  m1Name = "Primary",
+  m2Name = "Metastasis",
+  minMut = 0
+)
+
+tmp.df <- tmp$results %>%
+  mutate(Primary = Primary / {
+    all.data %>%
+      filter(Subset_Primary & Subset_Our_AD.MUT_M.WT) %>%
+      pluck("SAMPLE_ID") %>%
+      unique() %>% length()
+  }, Metastasis = Metastasis / {
+    all.data %>%
+      filter(Subset_Metastasis & Subset_Our_AD.MUT_M.WT) %>%
+      pluck("SAMPLE_ID") %>%
+      unique() %>% length()
+  }) %>%
+  select(Hugo_Symbol, Primary, Metastasis, pval) %>%
+  filter(Primary > penetrance | Metastasis > penetrance) %>%
+  arrange(pval)
+
+ggplot(tmp.df) +
+  aes(x = Primary, y = Metastasis, label = Hugo_Symbol) +
+  geom_abline(intercept = 0, slope = 1, linetype = 'dotted') +
+  geom_point(color = "black", data = . %>% filter(pval > 0.05)) +
+  geom_point(color = "red", data = . %>% filter(pval <= 0.05)) +
+  geom_label_repel(data = . %>% filter(pval <= 0.05)) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  scale_x_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(
+    title = "ATRX/DAXX-Mutant",
+    x = "Primaries",
+    y = "Metastases"
+  ) + 
+  theme(aspect.ratio=1)
+
+gt(tmp.df) %>%
+  cols_label(
+    Hugo_Symbol = "Gene",
+    Primary = "Primaries",
+    Metastasis = "Metastases",
+    pval = "p-value"
+  ) %>%
+  fmt_percent(columns = c("Primary", "Metastasis"),
+              decimals = 1) %>%
+  fmt(
+    columns = `pval`,
+    fns = function(p)
+      gtsummary::style_pvalue(p, decimals = 3)
+  ) %>%
+  tab_style(
+    style = list(cell_text(weight = 'bold')),
+    locations = cells_body(columns = `pval`, rows = `pval` < 0.05)
+  ) %>%
+  opt_stylize(style = 1, color = 'gray') %>%
+  opt_table_font(font = 'Arial') %>%
+  tab_header(title = "ATRX/DAXX-Mutant: Somatic Mutational Frequencies")
+```
+
+#### Figure 5E
+```{r}
+primaries.adm.wt <- mutations %>%
+  subsetMaf(
+    tsb = all.data %>%
+      filter(Subset_Primary &
+               Subset_Our_ADM.WT) %>%
+      pluck("SAMPLE_ID") %>%
+      unique()
+  )
+mets.adm.wt <- mutations %>%
+  subsetMaf(
+    tsb = all.data %>%
+      filter(Subset_Metastasis &
+               Subset_Our_ADM.WT) %>%
+      pluck("SAMPLE_ID") %>%
+      unique()
+  )
+tmp <- mafCompare(
+  primaries.adm.wt,
+  mets.adm.wt,
+  m1Name = "Primary",
+  m2Name = "Metastasis",
+  minMut = 0
+)
+
+tmp.df <- tmp$results %>%
+  mutate(Primary = Primary / {
+    all.data %>%
+      filter(Subset_Primary & Subset_Our_ADM.WT) %>%
+      pluck("SAMPLE_ID") %>%
+      unique() %>% length()
+  }, Metastasis = Metastasis / {
+    all.data %>%
+      filter(Subset_Metastasis & Subset_Our_ADM.WT) %>%
+      pluck("SAMPLE_ID") %>%
+      unique() %>% length()
+  })  %>%
+  select(Hugo_Symbol, Primary, Metastasis, pval) %>%
+  filter(Primary > penetrance | Metastasis > penetrance) %>%
+  arrange(pval)
+
+ggplot(tmp.df) +
+  aes(x = Primary, y = Metastasis, label = Hugo_Symbol) +
+  geom_abline(intercept = 0, slope = 1, linetype = 'dotted') +
+  geom_point(color = "black", data = . %>% filter(pval > 0.05)) +
+  geom_point(color = "red", data = . %>% filter(pval <= 0.05)) +
+  geom_label_repel(data = . %>% filter(pval <= 0.05)) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  scale_x_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(
+    title = "ADM-WT",
+    x = "Primaries",
+    y = "Metastases"
+  ) + 
+  theme(aspect.ratio=1)
+
+gt(tmp.df) %>%
+  cols_label(
+    Hugo_Symbol = "Gene",
+    Primary = "Primaries",
+    Metastasis = "Metastases",
+    pval = "p-value"
+  ) %>%
+  fmt_percent(columns = c("Primary", "Metastasis"),
+              decimals = 1) %>%
+  fmt(
+    columns = `pval`,
+    fns = function(p)
+      gtsummary::style_pvalue(p, decimals = 3)
+  ) %>%
+  tab_style(
+    style = list(cell_text(weight = 'bold')),
+    locations = cells_body(columns = `pval`, rows = `pval` < 0.05)
+  ) %>%
+  opt_stylize(style = 1, color = 'gray') %>%
+  opt_table_font(font = 'Arial') %>%
+  tab_header(title = "ADM-WT: Somatic Mutational Frequencies")
+```
+
+#### Figure 5F
+```{r}
+primaries.tks <- mutations %>%
+  subsetMaf(
+    tsb = all.data %>%
+      filter(Subset_Primary &
+               Subset_Our_TKS) %>%
+      pluck("SAMPLE_ID") %>%
+      unique()
+  )
+mets.tks <- mutations %>%
+  subsetMaf(
+    tsb = all.data %>%
+      filter(Subset_Metastasis &
+               Subset_Our_TKS) %>%
+      pluck("SAMPLE_ID") %>%
+      unique()
+  )
+tmp <- mafCompare(
+  primaries.tks,
+  mets.tks,
+  m1Name = "Primary",
+  m2Name = "Metastasis",
+  minMut = 0
+)
+
+tmp.df <- tmp$results %>%
+  mutate(Primary = Primary / {
+    all.data %>%
+      filter(Subset_Primary & Subset_Our_TKS) %>%
+      pluck("SAMPLE_ID") %>%
+      unique() %>% length()
+  }, Metastasis = Metastasis / {
+    all.data %>%
+      filter(Subset_Metastasis & Subset_Our_TKS) %>%
+      pluck("SAMPLE_ID") %>%
+      unique() %>% length()
+  })  %>%
+  select(Hugo_Symbol, Primary, Metastasis, pval) %>%
+  filter(Primary > penetrance | Metastasis > penetrance) %>%
+  arrange(pval)
+
+ggplot(tmp.df) +
+  aes(x = Primary, y = Metastasis, label = Hugo_Symbol) +
+  geom_abline(intercept = 0, slope = 1, linetype = 'dotted') +
+  geom_point(color = "black", data = . %>% filter(pval > 0.05)) +
+  geom_point(color = "red", data = . %>% filter(pval <= 0.05)) +
+  geom_label_repel(data = . %>% filter(pval <= 0.05)) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  scale_x_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(
+    title = "TP53/KRAS/SMAD4-Mutant",
+    x = "Primaries",
+    y = "Metastases"
+  ) + 
+  theme(aspect.ratio=1)
+
+gt(tmp.df) %>%
+  cols_label(
+    Hugo_Symbol = "Gene",
+    Primary = "Primaries",
+    Metastasis = "Metastases",
+    pval = "p-value"
+  ) %>%
+  fmt_percent(columns = c("Primary", "Metastasis"),
+              decimals = 1) %>%
+  fmt(
+    columns = `pval`,
+    fns = function(p)
+      gtsummary::style_pvalue(p, decimals = 3)
+  ) %>%
+  tab_style(
+    style = list(cell_text(weight = 'bold')),
+    locations = cells_body(columns = `pval`, rows = `pval` < 0.05)
+  ) %>%
+  opt_stylize(style = 1, color = 'gray') %>%
+  opt_table_font(font = 'Arial') %>%
+  tab_header(title = "TP53/KRAS/SMAD4-Mutant: Somatic Mutational Frequencies")
+```
+
+#### Figure 5G
+```{r}
+fit <- survfit2(
+    Surv(MONTHS, STATUS) ~ GROUP,
+    data = all.data %>%
+      filter(Subset_Primary) %>%
+      mutate(
+        MONTHS = OS_MONTHS,
+        STATUS = OS_STATUS == "DECEASED",
+        GROUP = case_when(
+          Subset_Our_AD.MUT_M.WT ~ "ATRX/DAXX-Mutant",
+          Subset_Our_ADM.MUT ~ "ADM-Mutant",
+          Subset_Our_AD.WT_M.MUT ~ "MEN1-Mutant",
+          Subset_Our_ADM.WT ~ "ADM-WT",
+          Subset_Our_TKS ~ "TP53/KRAS/SMAD4-Mutant",
+        )
+      )
+  )
+
+fit %>%
+  ggsurvfit(size = 0.75) +
+  add_pvalue() +
+  labs(
+    title = "Primary Tumors: Overall Survival", 
+    x = "Overall Survival (Months)", 
+    y = "Fractional Survival"
+  ) +
+  scale_x_continuous(breaks = seq(0, 180, 12), limits = c(0, 180)) +
+  ylim(0, 1) +
+  theme(
+    title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "bottom",
+    text = element_text(size = 16, family = "Arial"),
+    axis.text = element_text(size = 14),
+    legend.text = element_text(size = 12)
+  ) +
+  guides(color = guide_legend(ncol = 3)) +
+  scale_color_manual(
+    values = c(
+      "MEN1-Mutant" = "#339394",
+      "ADM-Mutant" = "#f0ee13",
+      "ADM-WT" = "#8d188f",
+      "ATRX/DAXX-Mutant" = "#3f50ab",
+      "TP53/KRAS/SMAD4-Mutant" = "#ee2722"
+    )
+  )
+
+fit
+```
+
+```{r}
+survminer::pairwise_survdiff(
+  Surv(MONTHS, STATUS) ~ GROUP,
+  data = all.data %>%
+    filter(Subset_Primary) %>%
+    mutate(
+      MONTHS = OS_MONTHS,
+      STATUS = OS_STATUS == "DECEASED",
+      GROUP = case_when(
+        Subset_Our_AD.MUT_M.WT ~ "ATRX/DAXX-Mutant",
+        Subset_Our_ADM.MUT ~ "ADM-Mutant",
+        Subset_Our_AD.WT_M.MUT ~ "MEN1-Mutant",
+        Subset_Our_ADM.WT ~ "ADM-WT",
+        Subset_Our_TKS ~ "TP53/KRAS/SMAD4-Mutant",
+      )
+    )
+)
+```
+
+
+#### Figure 5H
+```{r}
+fit <- survfit2(
+    Surv(MONTHS, STATUS) ~ GROUP,
+    data = all.data %>%
+      filter(Subset_Metastasis) %>%
+      mutate(
+        MONTHS = OS_MONTHS,
+        STATUS = OS_STATUS == "DECEASED",
+        GROUP = case_when(
+          Subset_Our_AD.MUT_M.WT ~ "ATRX/DAXX-Mutant",
+          Subset_Our_ADM.MUT ~ "ADM-Mutant",
+          Subset_Our_AD.WT_M.MUT ~ "MEN1-Mutant",
+          Subset_Our_ADM.WT ~ "ADM-WT",
+          Subset_Our_TKS ~ "TP53/KRAS/SMAD4-Mutant",
+        )
+      )
+  )
+
+fit %>%
+  ggsurvfit(size = 0.75) +
+  add_pvalue() +
+  labs(
+    title = "Metastatic Tumors: Overall Survival", 
+    x = "Overall Survival (Months)", 
+    y = "Fractional Survival"
+  ) +
+  scale_x_continuous(breaks = seq(0, 72, 12), limits = c(0, 72)) +
+  ylim(0, 1) +
+  theme(
+    title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "bottom",
+    text = element_text(size = 16, family = "Arial"),
+    axis.text = element_text(size = 14),
+    legend.text = element_text(size = 12)
+  ) +
+  guides(color=guide_legend(ncol = 3)) +
+  scale_color_manual(
+    values = c(
+      "MEN1-Mutant" = "#339394",
+      "ADM-Mutant" = "#f0ee13",
+      "ADM-WT" = "#8d188f",
+      "ATRX/DAXX-Mutant" = "#3f50ab",
+      "TP53/KRAS/SMAD4-Mutant" = "#ee2722"
+    )
+  )
+
+fit
+```
+
+```{r}
+survminer::pairwise_survdiff(
+  Surv(MONTHS, STATUS) ~ GROUP,
+  data = all.data %>%
+    filter(Subset_Metastasis) %>%
+    mutate(
+      MONTHS = OS_MONTHS,
+      STATUS = OS_STATUS == "DECEASED",
+      GROUP = case_when(
+        Subset_Our_AD.MUT_M.WT ~ "ATRX/DAXX-Mutant",
+        Subset_Our_ADM.MUT ~ "ADM-Mutant",
+        Subset_Our_AD.WT_M.MUT ~ "MEN1-Mutant",
+        Subset_Our_ADM.WT ~ "ADM-WT",
+        Subset_Our_TKS ~ "TP53/KRAS/SMAD4-Mutant",
+      )
+    )
+)
+```
+
+
+## Manuscript Tables
+### Table 1
+```{r, warning=FALSE, error=FALSE}
+all.data %>%
+  select(
+    SAMPLE_TYPE, 
+    RACE,
+    SEX,
+    OS_STATUS, 
+    COUNTRY,
+    GRADE, 
+    SOURCE
+  ) %>%
+  tbl_summary(by = "SAMPLE_TYPE") %>%
+  add_p(include = c(everything(), -SOURCE))
+```
+
+### Gene Panel
+```{r}
+data.frame(Genes = geneset.intersect) 
+
+data.frame(Genes = geneset.intersect) %>%
+  write.csv("Gene-Panel.csv", na = "", row.names = FALSE)
+```
+
+## Session Info and Citations
+```{r}
+sessionInfo()
+```
+
+```{r}
+packages_in_use <- c( names( sessionInfo()$otherPkgs ) )
+the_citations_list <- lapply( X=packages_in_use, FUN=citation)
+the_citations_list
+```
