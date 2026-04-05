@@ -106,6 +106,17 @@ regional.LN <- read_csv("data/ref/regional LN.csv", comment = '#')
 
 supplemental <-
   read.csv('data/ref/Updated PNET case list.csv', stringsAsFactors = FALSE) %>%
+  full_join(
+    read.csv('data/ref/updated_grade_diff.csv', stringsAsFactors = FALSE) %>%
+      select(
+        Dataset, 
+        Patient_ID,
+        Sample_ID,
+        Updated.Grade = Grade,
+        Updated.Differentiation = Differentiation
+      ),
+    by = c("Dataset", "Patient_ID", "Sample_ID")
+  ) %>% 
   mutate(across(c('Nodal.Involvement', 'Metastatic'), as.numeric)) %>%
   mutate(Grade.1 = case_when(
     !is.na(Grade.1) ~ Grade.1,
@@ -171,6 +182,17 @@ function(f) {
   filter(!(PATIENT_ID %in% (
     supplemental %>% filter(NET.NEC == 'NEC') %>% pluck('Patient_ID')
   ))) %>%
+  # Remove high and poorly differentiated patients
+  filter(!(PATIENT_ID %in% (
+    supplemental %>%
+      filter(
+        str_trim(Updated.Grade) == "high" |
+          str_trim(Updated.Grade) == "3" |
+          str_trim(Updated.Differentiation) == "poorly differentiated" |
+          str_trim(Updated.Differentiation) == "Neuroendocrine Carcinoma - Well Differentiated"
+      ) %>%
+      pluck('Patient_ID')
+  ))) %>%
   # Grading is in supplemental
   rename(RAW_GRADE = GRADE) %>%
   left_join(
@@ -178,11 +200,12 @@ function(f) {
       PATIENT_ID = Patient_ID,
       SUPP_SAMPLE_ID = Sample_ID,
       NODE_INVOLVEMENT = Nodal.Involvement,
-      TMN = TMN.Staging,
+      TNM = TMN.Staging,
       NET.NEC = NET.NEC,
       METASTATIC = Metastatic,
       SUPP_SAMPLE_TYPE = Sample.Type,
-      GRADE = Grade.1
+      GRADE = Grade.1,
+      DIFFERENTIATION = Updated.Differentiation
     ) %>%
       mutate(across(where(is.character), ~ . %>% str_squish)),
     by = c("PATIENT_ID" = "PATIENT_ID")
@@ -202,7 +225,7 @@ function(f) {
     NODE_INVOLVEMENT = first(na.omit(NODE_INVOLVEMENT)),
     METASTATIC = first(na.omit(METASTATIC)),
     REGIONAL_LN = first(na.omit(REGIONAL_LN)),
-    TMN = first(na.omit(TMN))
+    TNM = first(na.omit(TNM))
   ) %>%
   slice_max(order_by = TMB_NONSYNONYMOUS,
             n = 1,
@@ -525,37 +548,6 @@ tmp %>%
 ```
 
 #### Figure 1B
-
-```{r}
-all.data %>%
-  ggplot() +
-  aes(x = SAMPLE_TYPE, y = TMB_NONSYNONYMOUS, fill = SAMPLE_TYPE) +
-  stat_summary(fun.data = \(x) {
-    r <- quantile(x, probs=c(0, 0.05, 0.5, 0.95, 1))
-    names(r) <- c("ymin", "lower", "middle", "upper", "ymax")
-  r
-    }, geom="boxplot") +
-  labs(
-    title = "Sample Type: TMB",
-    x = "Sample Type",
-    y = bquote('Mutations/'~10^6~"Bases")
-  ) +
-  theme(
-    legend.position = "none"
-  )
-
-all.data %>%
-  t.test(TMB_NONSYNONYMOUS ~ SAMPLE_TYPE,
-         var.equal = TRUE,
-         data = .)
-
-all.data %>%
-  wilcox.test(TMB_NONSYNONYMOUS ~ SAMPLE_TYPE,
-              var.equal = TRUE,
-              data = .)
-```
-
-#### Figure 1C
 ```{r, message=FALSE}
 primaries <- mutations %>%
   subsetMaf(tsb = all.data %>%
@@ -641,7 +633,7 @@ gt(tmp$table) %>%
   tab_header(title = "Sample Type: Somatic Mutational Frequencies")
 ```
 
-#### Figure 1D
+#### Figure 1C
 ```{r, fig.height=8.5/1.5, fig.width=11/1.5, fig.ext=c('png', 'pdf')}
 features <- all.data %>%
   select(SAMPLE_ID, SAMPLE_TYPE) %>%
