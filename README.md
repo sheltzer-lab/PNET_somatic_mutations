@@ -1,5 +1,9 @@
 # Somatic mutational profiling identifies aggressive and indolent disease phenotypes in well-differentiated pancreatic neuroendocrine tumors
 
+This work was published as:
+
+> Brown LM†, Hagenson RA†, Sheltzer JM and Kunstman JW (2026) Somatic mutational profiling identifies aggressive and indolent disease phenotypes in well-differentiated pancreatic neuroendocrine tumors. Front. Oncol. 16:1757796. doi: 10.3389/fonc.2026.1757796
+
 ## Data Availability
 
 Below is a breakdown of the data that this project relies upon, specifically what it represents and whether it is publicly available.
